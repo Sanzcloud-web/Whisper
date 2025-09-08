@@ -13,6 +13,7 @@ import threading
 import time
 import queue
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import whisper
 import ssl
 import urllib.request
@@ -23,14 +24,14 @@ ssl._create_default_https_context = ssl._create_unverified_context
 class ContinuousAudioRecorder:
     """Enregistreur audio continu avec buffer circulaire"""
     
-    def __init__(self, chunk_size=1024, sample_rate=22050, channels=1, overlap_duration=2):
-        self.chunk_size = chunk_size
-        self.sample_rate = sample_rate
+    def __init__(self, chunk_size=2048, sample_rate=44100, channels=1, overlap_duration=2):
+        self.chunk_size = chunk_size          # Plus gros chunks pour moins de perte
+        self.sample_rate = sample_rate        # Fréquence plus haute pour meilleure qualité
         self.channels = channels
         self.format = pyaudio.paInt16
         self.audio = pyaudio.PyAudio()
         self.recording = False
-        self.overlap_duration = overlap_duration  # Chevauchement en secondes
+        self.overlap_duration = overlap_duration
         
         # Buffer circulaire pour stockage continu
         self.audio_queue = queue.Queue()
@@ -45,45 +46,66 @@ class ContinuousAudioRecorder:
         
     def _record_continuously(self):
         """Enregistre en continu dans un thread séparé"""
-        stream = self.audio.open(
-            format=self.format,
-            channels=self.channels,
-            rate=self.sample_rate,
-            input=True,
-            frames_per_buffer=self.chunk_size
-        )
-        
-        print("🔴 Enregistrement continu démarré...")
-        
-        while self.recording:
-            try:
-                data = stream.read(self.chunk_size)
-                self.audio_queue.put(data)
-            except Exception as e:
-                print(f"Erreur enregistrement: {e}")
-                break
-                
-        stream.stop_stream()
-        stream.close()
-        print("🔴 Enregistrement continu arrêté.")
+        try:
+            # Tenter d'accéder au micro avec gestion de conflit
+            stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                frames_per_buffer=self.chunk_size,
+                input_device_index=None,  # Utilise le micro par défaut
+                stream_callback=None
+            )
+            
+            print("🔴 Enregistrement continu démarré...")
+            print(f"📊 Config: {self.sample_rate}Hz, chunks={self.chunk_size}")
+            
+            while self.recording:
+                try:
+                    # Lecture non-bloquante avec gestion d'erreur
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                    if data:
+                        self.audio_queue.put(data)
+                except Exception as e:
+                    print(f"⚠️ Erreur lecture audio: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Erreur ouverture stream: {e}")
+            return
+        finally:
+            if 'stream' in locals():
+                stream.stop_stream()
+                stream.close()
+            print("🔴 Enregistrement continu arrêté.")
     
     def get_audio_segment(self, duration=10):
         """Récupère un segment audio du buffer"""
         frames_needed = int(self.sample_rate / self.chunk_size * duration)
         frames = []
+        empty_count = 0
         
-        # Récupérer les frames du buffer
-        for _ in range(frames_needed):
+        print(f"🎯 Récupération {frames_needed} frames pour {duration}s...")
+        
+        # Récupérer les frames du buffer avec diagnostic
+        for i in range(frames_needed):
             try:
-                frame = self.audio_queue.get(timeout=1.0)
+                frame = self.audio_queue.get(timeout=2.0)
                 frames.append(frame)
+                empty_count = 0  # Reset counter
             except queue.Empty:
-                print("⚠️  Buffer audio vide, attente...")
+                empty_count += 1
+                if empty_count > 5:
+                    print(f"⚠️ Buffer vide depuis {empty_count} tentatives, taille buffer: {self.audio_queue.qsize()}")
                 time.sleep(0.1)
                 continue
         
         if not frames:
+            print("❌ Aucune frame récupérée!")
             return None
+            
+        print(f"✅ {len(frames)} frames récupérées sur {frames_needed} demandées")
             
         # Créer le dossier transcription s'il n'existe pas
         os.makedirs("transcription", exist_ok=True)
@@ -112,14 +134,15 @@ class ContinuousAudioRecorder:
         self.stop_recording()
         self.audio.terminate()
 
-class JSONTranscriptionClient:
-    """Client pour la transcription avec sauvegarde JSON"""
+class ParallelTranscriptionClient:
+    """Client de transcription parallèle avec ThreadPoolExecutor"""
     
-    def __init__(self, model="base", lang="fr"):
+    def __init__(self, model="base", lang="fr", max_workers=2):
         self.model_name = model
         self.lang = lang
         self.session_start = datetime.now()
         self.whisper_model = None
+        self.max_workers = max_workers
         
         # Créer le dossier transcription
         os.makedirs("transcription", exist_ok=True)
@@ -128,13 +151,20 @@ class JSONTranscriptionClient:
         session_id = self.session_start.strftime("%Y%m%d_%H%M%S")
         self.json_file = f"transcription/session_{session_id}.json"
         
+        # ThreadPool pour transcriptions parallèles
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_transcriptions = {}  # Suivi des tâches
+        
+        # Lock pour accès concurrent au JSON
+        self.json_lock = threading.Lock()
+        
         # Initialiser le fichier JSON
         self.init_json_file()
         
         # Charger le modèle Whisper
         print(f"Chargement du modèle Whisper '{model}'...")
         self.whisper_model = whisper.load_model(model)
-        print("Modèle chargé!")
+        print(f"Modèle chargé! ThreadPool: {max_workers} workers")
         
     def init_json_file(self):
         """Initialise le fichier JSON"""
@@ -154,23 +184,23 @@ class JSONTranscriptionClient:
         
         print(f"Fichier JSON initialisé: {self.json_file}")
     
-    def transcribe_audio(self, audio_file):
-        """Transcrit un fichier audio"""
+    def _transcribe_single(self, audio_file):
+        """Transcrit un seul fichier audio (worker thread)"""
         if self.whisper_model is None:
             return ""
         
         try:
-            # Options optimisées pour amphithéâtre
+            # Paramètres optimaux pour cours/amphithéâtre
             result = self.whisper_model.transcribe(
                 audio_file, 
                 language=self.lang,
                 fp16=False,                # Force CPU mode
-                no_speech_threshold=0.4,   # Plus sensible pour voix lointaine
-                logprob_threshold=-1.0,    # Filtre les prédictions peu fiables
-                temperature=0.0,           # Pas de randomness
-                compression_ratio_threshold=2.4,  # Améliore la robustesse
+                logprob_threshold=-1.0,    # Valeur standard recommandée
+                temperature=0.0,           # Déterministe pour cohérence
+                compression_ratio_threshold=1.35,  # Optimisé pour voix classique
                 condition_on_previous_text=True,  # Contexte pour cohérence
-                word_timestamps=False       # Pas de timestamps de mots (plus rapide)
+                word_timestamps=False,     # Plus rapide
+                no_speech_threshold=0.2    # Équilibré pour voix prof
             )
             
             # Nettoyer le texte des artefacts
@@ -181,20 +211,59 @@ class JSONTranscriptionClient:
             for artifact in artifacts:
                 text = text.replace(artifact, '')
             
-            # Retourner seulement si le texte est significatif
-            if len(text) > 2 and not text.isspace():
-                return text
-            else:
-                return ""
+            return text
                 
         except Exception as e:
-            print(f"Erreur transcription: {e}")
+            print(f"❌ Erreur transcription: {e}")
             return ""
     
+    def transcribe_audio_async(self, audio_file, segment_id):
+        """Lance une transcription en parallèle"""
+        future = self.executor.submit(self._transcribe_single, audio_file)
+        self.pending_transcriptions[segment_id] = {
+            'future': future,
+            'audio_file': audio_file,
+            'timestamp': datetime.now()
+        }
+        return future
+    
+    def check_completed_transcriptions(self):
+        """Vérifie et traite les transcriptions terminées"""
+        completed = []
+        
+        for segment_id, task in self.pending_transcriptions.items():
+            future = task['future']
+            if future.done():
+                try:
+                    text = future.result()
+                    timestamp = task['timestamp']
+                    
+                    # Sauvegarder le résultat
+                    self.save_transcription(text, timestamp.isoformat())
+                    
+                    # Nettoyer le fichier audio
+                    try:
+                        os.remove(task['audio_file'])
+                    except Exception as e:
+                        print(f"⚠️ Erreur suppression {task['audio_file']}: {e}")
+                    
+                    completed.append(segment_id)
+                    print(f"✅ Segment {segment_id} transcrit: '{text[:50]}...' 🗑️")
+                    
+                except Exception as e:
+                    print(f"❌ Erreur récupération résultat {segment_id}: {e}")
+                    completed.append(segment_id)
+        
+        # Nettoyer les tâches terminées
+        for segment_id in completed:
+            del self.pending_transcriptions[segment_id]
+        
+        return len(completed)
+    
     def save_transcription(self, text, timestamp=None):
-        """Sauvegarde dans le JSON"""
-        if not text or not text.strip():
-            return
+        """Sauvegarde thread-safe dans le JSON"""
+        if text is None:
+            text = ""
             
         if timestamp is None:
             timestamp = datetime.now().isoformat()
@@ -204,36 +273,50 @@ class JSONTranscriptionClient:
             "text": text.strip()
         }
         
-        try:
-            with open(self.json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            data = {"session": {}, "transcriptions": []}
-        
-        data["transcriptions"].append(transcription_entry)
-        
-        with open(self.json_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        print(f"[{timestamp[:19]}] {text}")
-    
-    def finalize_session(self):
-        """Finalise la session"""
-        try:
-            with open(self.json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        # Accès thread-safe au fichier JSON
+        with self.json_lock:
+            try:
+                with open(self.json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                data = {"session": {}, "transcriptions": []}
             
-            data["session"]["end_time"] = datetime.now().isoformat()
-            data["session"]["status"] = "completed"
-            data["session"]["total_transcriptions"] = len(data["transcriptions"])
+            data["transcriptions"].append(transcription_entry)
             
             with open(self.json_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            print(f"\nSession finalisée. {len(data['transcriptions'])} transcriptions sauvegardées.")
-            
-        except Exception as e:
-            print(f"Erreur finalisation: {e}")
+    
+    def finalize_session(self):
+        """Finalise la session et attend les transcriptions en cours"""
+        print("🔄 Finalisation des transcriptions en cours...")
+        
+        # Attendre que toutes les transcriptions se terminent
+        while self.pending_transcriptions:
+            completed = self.check_completed_transcriptions()
+            if completed > 0:
+                print(f"⏳ {completed} transcriptions terminées, reste: {len(self.pending_transcriptions)}")
+            time.sleep(0.5)
+        
+        # Fermer le ThreadPool
+        self.executor.shutdown(wait=True)
+        
+        # Finaliser le JSON
+        with self.json_lock:
+            try:
+                with open(self.json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                data["session"]["end_time"] = datetime.now().isoformat()
+                data["session"]["status"] = "completed"
+                data["session"]["total_transcriptions"] = len(data["transcriptions"])
+                
+                with open(self.json_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                print(f"\n✅ Session finalisée. {len(data['transcriptions'])} transcriptions sauvegardées.")
+                
+            except Exception as e:
+                print(f"❌ Erreur finalisation: {e}")
 
 def cleanup_temp_files():
     """Nettoie les fichiers temporaires au démarrage"""
@@ -257,52 +340,46 @@ def main():
     cleanup_temp_files()
     
     try:
-        # Créer les clients avec modèle large pour amphithéâtre
-        transcription_client = JSONTranscriptionClient(model="large", lang="fr")
+        # Créer les clients avec transcription PARALLÈLE
+        transcription_client = ParallelTranscriptionClient(model="large", lang="fr", max_workers=2)
         audio_recorder = ContinuousAudioRecorder()
         
-        print("Configuration terminée. Démarrage de la transcription...")
-        print("Enregistrement CONTINU - aucun audio perdu!")
+        print("Configuration terminée. Démarrage de la transcription PARALLÈLE...")
+        print("Enregistrement CONTINU + Transcription PARALLÈLE = VITESSE MAX!")
         print("Ctrl+C pour arrêter.")
         print(f"📁 Dossier: transcription/")
         print(f"📄 Fichier JSON: {transcription_client.json_file}")
-        print("🎵 Segments audio: transcription/segment_HHMMSS.wav")
-        print("Segments analysés toutes les 8 secondes (optimisé amphithéâtre)...")
+        print("🚀 2 threads de transcription en parallèle")
+        print("Segments analysés toutes les 3 secondes...")
         print("-" * 50)
         
         # Démarrer l'enregistrement continu
         audio_recorder.start_continuous_recording()
         time.sleep(2)  # Laisser le buffer se remplir
         
-        # Boucle de transcription en parallèle
+        segment_counter = 0
+        
+        # Boucle de transcription ULTRA-RAPIDE
         while True:
             try:
-                # Récupérer un segment du buffer continu
-                print("📊 Analyse segment...", end="", flush=True)
+                # Vérifier les transcriptions terminées
+                completed = transcription_client.check_completed_transcriptions()
+                
+                # Récupérer un nouveau segment
+                print(f"📊 Segment #{segment_counter}...", end="", flush=True)
                 temp_audio = audio_recorder.get_audio_segment(duration=10)
                 
                 if temp_audio:
-                    # Transcrire
-                    print(" 🔄 Transcription...", end="", flush=True)
-                    text = transcription_client.transcribe_audio(temp_audio)
-                    
-                    # Supprimer le fichier audio temporaire
-                    try:
-                        os.remove(temp_audio)
-                    except Exception as e:
-                        print(f" ⚠️ Erreur suppression {temp_audio}: {e}")
-                    
-                    # Sauvegarder si non vide
-                    if text:
-                        transcription_client.save_transcription(text)
-                        print(" ✅ 🗑️")
-                    else:
-                        print(" 🔇 🗑️")
+                    # Lancer transcription en PARALLÈLE (non-bloquant!)
+                    print(" 🚀 Lancé en parallèle...", end="", flush=True)
+                    transcription_client.transcribe_audio_async(temp_audio, segment_counter)
+                    print(" ✅")
+                    segment_counter += 1
                 else:
                     print(" ⚠️ (pas de données)")
                 
-                # Délai avant le prochain segment
-                time.sleep(8)  # Analyse toutes les 8 secondes
+                # Délai RÉDUIT pour vitesse maximale
+                time.sleep(3)  # Analyse toutes les 3 secondes
                 
             except Exception as e:
                 print(f"\nErreur dans la boucle: {e}")
