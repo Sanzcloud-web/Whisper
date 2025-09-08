@@ -1,0 +1,5 @@
+# OpenAI Whisper - Transcription locale
+openai-whisper
+
+# Audio
+pyaudio
