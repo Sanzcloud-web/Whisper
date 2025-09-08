@@ -118,9 +118,15 @@ class JSONTranscriptionClient:
     def __init__(self, model="base", lang="fr"):
         self.model_name = model
         self.lang = lang
-        self.json_file = "transcription.json"
-        self.session_start = datetime.now().isoformat()
+        self.session_start = datetime.now()
         self.whisper_model = None
+        
+        # Créer le dossier transcription
+        os.makedirs("transcription", exist_ok=True)
+        
+        # Nom de fichier unique avec timestamp
+        session_id = self.session_start.strftime("%Y%m%d_%H%M%S")
+        self.json_file = f"transcription/session_{session_id}.json"
         
         # Initialiser le fichier JSON
         self.init_json_file()
@@ -134,7 +140,8 @@ class JSONTranscriptionClient:
         """Initialise le fichier JSON"""
         session_data = {
             "session": {
-                "start_time": self.session_start,
+                "start_time": self.session_start.isoformat(),
+                "session_id": self.session_start.strftime("%Y%m%d_%H%M%S"),
                 "language": self.lang,
                 "model": self.model_name,
                 "status": "active"
@@ -228,11 +235,26 @@ class JSONTranscriptionClient:
         except Exception as e:
             print(f"Erreur finalisation: {e}")
 
+def cleanup_temp_files():
+    """Nettoie les fichiers temporaires au démarrage"""
+    if os.path.exists("transcription"):
+        temp_files = [f for f in os.listdir("transcription") if f.startswith("segment_") and f.endswith(".wav")]
+        if temp_files:
+            print(f"🗑️ Nettoyage de {len(temp_files)} fichier(s) temporaire(s)...")
+            for file in temp_files:
+                try:
+                    os.remove(f"transcription/{file}")
+                except Exception as e:
+                    print(f"Erreur suppression {file}: {e}")
+
 def main():
     """
     Lance la transcription en temps réel avec OpenAI Whisper
     """
     print("Initialisation de la transcription Whisper avec sauvegarde JSON...")
+    
+    # Nettoyer les fichiers temporaires
+    cleanup_temp_files()
     
     try:
         # Créer les clients avec modèle large pour amphithéâtre
@@ -242,7 +264,9 @@ def main():
         print("Configuration terminée. Démarrage de la transcription...")
         print("Enregistrement CONTINU - aucun audio perdu!")
         print("Ctrl+C pour arrêter.")
-        print(f"Transcriptions sauvegardées dans: {transcription_client.json_file}")
+        print(f"📁 Dossier: transcription/")
+        print(f"📄 Fichier JSON: {transcription_client.json_file}")
+        print("🎵 Segments audio: transcription/segment_HHMMSS.wav")
         print("Segments analysés toutes les 8 secondes (optimisé amphithéâtre)...")
         print("-" * 50)
         
@@ -262,12 +286,18 @@ def main():
                     print(" 🔄 Transcription...", end="", flush=True)
                     text = transcription_client.transcribe_audio(temp_audio)
                     
+                    # Supprimer le fichier audio temporaire
+                    try:
+                        os.remove(temp_audio)
+                    except Exception as e:
+                        print(f" ⚠️ Erreur suppression {temp_audio}: {e}")
+                    
                     # Sauvegarder si non vide
                     if text:
                         transcription_client.save_transcription(text)
-                        print(" ✅")
+                        print(" ✅ 🗑️")
                     else:
-                        print(" 🔇 (silence)")
+                        print(" 🔇 🗑️")
                 else:
                     print(" ⚠️ (pas de données)")
                 
